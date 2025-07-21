@@ -1,0 +1,16 @@
+# Secret credential files
+.env
+electric-bill-ocr-key.json
+
+# Python virtual environment
+/venv/
+
+# Python cache
+/__pycache__/
+*.pyc
+
+# Temporary upload folder
+/uploads/
+
+# OS-specific files
+.DS_Store

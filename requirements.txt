@@ -1,0 +1,7 @@
+Flask
+google-cloud-vision
+openai
+pandas
+python-dotenv
+werkzeug
+gunicorn
