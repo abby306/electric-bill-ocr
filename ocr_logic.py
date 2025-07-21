@@ -4,64 +4,77 @@ from openai import OpenAI
 from google.cloud import vision
 from google.oauth2 import service_account
 
-# --- V5 Prompt Generation Functions (Balanced Approach) ---
+# --- V10 Prompt Generation Functions (Comprehensive & Flexible) ---
 
 def get_stage1_prompt(raw_text, doc_name, page_num):
     """
-    MODIFIED: A balanced prompt that prioritizes finding a single total amount,
-    but falls back to summing charge components if a total is not available.
+    MODIFIED: A comprehensive "master" prompt designed to handle a wide variety of bill formats,
+    including complex summary tables and detailed single-site sections.
     """
     return f"""
-    You are a data extraction expert for utility bills. Your primary goal is to identify each distinct service location on the page and extract its billing information for a single period.
+    You are a world-class data extraction expert for a data science team. Your only goal is to extract historical consumption data from utility bills. You must meticulously ignore all costs, charges, and financial data.
 
     Analyze the text from page {page_num} of document "{doc_name}":
     ---
     {raw_text}
     ---
 
-    Follow these steps precisely for each service location you identify on the page:
+    Follow this comprehensive rule-based process:
 
-    1.  **Identify Key Information:**
-        - `customer_name`: The name of the customer (e.g., "Wynyard, Town Of"). This is mandatory.
-        - `account_number`: The primary account or customer number.
-        - `service_address`: The full address for the service location. This is mandatory.
-        - `billing_period`: The date range for the bill. **Ensure the start date is before the end date.**
+    1.  **Identify Global Information (Applies to the whole document):**
+        - Find the main `customer_name` (e.g., "Town of Two Hills", "Flagstaff County", "Hughes Petroleum Ltd."). If not available, skip it.
+        - Find the primary `customer_identifier`. This is a persistent ID for the customer, often labeled "Customer ID", or similar (e.g., "C358437-2"). **Crucially, you must IGNORE temporary identifiers like "Invoice Number" or Account number since these are mostly related to the service provider.** 
+        - Find a global `billing_period` if one is stated for the entire invoice (e.g., "THIS IS YOUR INVOICE FOR AUGUST 01, 2022 TO AUGUST 31, 2022" or something like that). This will be the default period.
+        - any detail including site address, site id/number. make sure that one site id corresponds to one site number
 
-    2.  **Determine Total Cost (Use one of two methods):**
-        - **Method A (Preferred):** Look for a clear, final "Total Amount Due", "Total Bill", or "Amount Due". If you find it, use this value for the `total_amount_due`.
-        - **Method B (Fallback):** If and ONLY IF you cannot find a single total amount, then look for the following charge components: `gas_delivery_service_cost`, `gas_supply_cost`, and `federal_carbon_tax`. If found, list them in a `charge_breakdown` list and calculate their sum for the `total_amount_due`.
 
-    3.  **Final Output Structure:**
-        - Create a JSON object containing the `customer_name` and `account_number`.
-        - Include a `site_bills` list. Each object in this list represents a unique service location from the page and must contain its `service_address`, `billing_period`, and either the `total_amount_due` (from Method A) or both the `total_amount_due` and `charge_breakdown` (from Method B).
+    2.  **Scan for Data Blocks (A page can have multiple blocks):**
+        - **Data Block Type A (Multi-Site Summary Table):** Look for a table listing multiple sites. Headers might include "Site ID", "Site Description", "Name", and a consumption column. make sure that one site id corresponds to one site number
+        - **Data Block Type B (Single-Site Detail Section):** Look for a section focused on one location, often starting with "SERVICE SUPPLIED TO" or "Site Detail".
 
-    Example Output (Method A - Simple Bill):
+    3.  **Data Extraction Logic per Block:**
+        - **For a Summary Table (Type A):**
+            a. For EACH row, extract the `site_id`, `site_name` or `service_address`.
+            b. Find the `consumption_value`. The column header could be "Total kWh", "Total Energy (kWh)", "Consumption", "Usage in m³", "GJ", or similar. Be flexible.
+            c. Extract the `consumption_unit` from the header or data.
+            d. Use the global `billing_period` found in Step 1 for every record in this table.
+        - **For a Detail Section (Type B):**
+            a. Extract the specific `service_address` for this site.
+            b. Find a `site_id` if available within this section.
+            c. Find the specific `billing_period` for this section (e.g., "Consumption Period From...To...", or a pair of dates near the meter readings). This specific period OVERRIDES the global one for this record.
+            d. Find the `consumption_value` and `consumption_unit` from lines like "Usage in m³", "Amount of electric energy you used", or "Metered Energy".
+
+    4.  **Final Output Structure:**
+        - Create a JSON object containing the `customer_name` and `customer_identifier`.
+        - Include a `consumption_records` list. Each object in this list is a unique record you found from any data block. A record MUST contain `site_id` (if available), `service_address` (or `site_name`), `billing_period`, `consumption_value`, and `consumption_unit`.
+        - If a page contains no discernible consumption data (e.g., a cover page or a water bill with no usage), the `consumption_records` list should be empty.
+
+    Example Output from a Summary Table:
     {{
-      "customer_name": "ABC Corp",
-      "account_number": "12345",
-      "site_bills": [
+      "customer_name": "Flagstaff County",
+      "customer_identifier": "1001043",
+      "consumption_records": [
         {{
-          "service_address": "100 Main St, Anytown",
-          "billing_period": "2023-01-01 to 2023-01-31",
-          "total_amount_due": 550.75
+          "site_id": "10015480522",
+          "service_address": "Commercial PW",
+          "billing_period": "2022-08-01 to 2022-08-31",
+          "consumption_value": 670.81,
+          "consumption_unit": "kWh"
         }}
       ]
     }}
 
-    Example Output (Method B - Complex Bill):
+    Example Output from a Detailed Gas Bill Page:
     {{
       "customer_name": "Wynyard, Town Of",
-      "account_number": "422 070 0000 3",
-      "site_bills": [
+      "customer_identifier": "422 070 0000 3",
+      "consumption_records": [
         {{
+          "site_id": "4720700797",
           "service_address": "323 Bosworth St, Wynyard, SOA 4T0",
           "billing_period": "2023-02-09 to 2023-03-09",
-          "charge_breakdown": {{
-            "gas_delivery_service_cost": 147.20,
-            "gas_supply_cost": 146.13,
-            "federal_carbon_tax": 108.21
-          }},
-          "total_amount_due": 401.54
+          "consumption_value": 1052.728,
+          "consumption_unit": "m³"
         }}
       ]
     }}
@@ -69,8 +82,8 @@ def get_stage1_prompt(raw_text, doc_name, page_num):
 
 def get_stage2_prompt(list_of_page_outputs, entity_filter):
     """
-    Aggregates the structured data from Stage 1.
-    This prompt is robust enough to handle both simple and complex records.
+    MODIFIED: This prompt creates a cleanly labeled nested structure, using the more specific
+    site_id for grouping.
     """
     filter_instruction = (
         f'The user has provided a filter: "{entity_filter}". Your final output must ONLY contain data for that entity.'
@@ -78,63 +91,56 @@ def get_stage2_prompt(list_of_page_outputs, entity_filter):
         else "The user has not provided a filter. Report on ALL unique entities found in the data."
     )
 
-    # Flatten the data structure from Stage 1 to create a simple list of all bills
-    all_site_bills = []
+    # Flatten the data structure from Stage 1 into a simple list of all records
+    all_consumption_records = []
     for page_data in list_of_page_outputs:
         customer_name = page_data.get("customer_name")
-        account_number = page_data.get("account_number")
-        for bill in page_data.get("site_bills", []):
-            bill['customer_name'] = customer_name
-            bill['account_number'] = account_number
-            all_site_bills.append(bill)
+        customer_identifier = page_data.get("customer_identifier")
+        for record in page_data.get("consumption_records", []):
+            record['customer_name'] = customer_name
+            record['customer_identifier'] = customer_identifier
+            all_consumption_records.append(record)
 
     return f"""
-    You are a senior financial analyst. You will be given a list of JSON objects, where each object is a complete billing record for a specific site and a single billing period. Some records may include a charge breakdown, others may not.
+    You are a data scientist's assistant. You will be given a list of JSON objects, where each object is a clean consumption record.
 
-    Your task is to group these records into a final nested report.
+    Your task is to group these records into a final, clearly-labeled, nested JSON structure.
 
-    1.  **Primary Grouping:** Group all records by `customer_name`.
-    2.  **Secondary Grouping:** Within each customer, group by `account_number`.
-    3.  **Tertiary Grouping:** Within each account, group by `service_address`.
-    4.  **Final Structure:** Each service address should have a `billing_records` list containing all its billing period objects. Preserve the `charge_breakdown` field only if it exists in the source record.
-    5.  **Apply Filter:** {filter_instruction}
+    1.  **Top Level:** The root of the JSON should be an object with a single key, "customers", which is a list of customer objects.
+    2.  **Customer Level:** Each object in the "customers" list should have a `customer_name` and `customer_identifier` key, plus a `sites` list.
+    3.  **Site Level:** Each object in the "sites" list should have a `site_id` (if available) and `service_address` (or `site_name`) key, plus a `data` list.
+    4.  **Data Level:** The `data` list should contain all the consumption record objects for that site. The objects inside this list should ONLY contain `billing_period`, `consumption_value`, and `consumption_unit`. Do not repeat parent information.
+    5.  **Grouping Logic:** Group records first by `customer_name`, then by `customer_identifier`, and finally by a unique combination of `site_id` and `service_address`.
+    6.  **Sorting:** The final records in each `data` list should be sorted by billing period, oldest to newest.
+    7.  **Apply Filter:** {filter_instruction}
 
-    Here is the list of all billing records:
+    Here is the list of all consumption records:
     ---
-    {json.dumps(all_site_bills, indent=2)}
+    {json.dumps(all_consumption_records, indent=2)}
     ---
 
-    Present the final, consolidated report as a nested JSON object.
+    Present the final, consolidated report as a nested JSON object, following the exact structure described above.
     """
 
-# --- Helper and Orchestration Functions ---
+# --- Helper Functions (No changes needed) ---
 
 def extract_text_from_pages(file_path, google_credentials):
-    """
-    Extracts text from each page of a file (PDF or image).
-    Returns a list of dictionaries, e.g., [{"page_num": 1, "text": "..."}].
-    """
     vision_client = vision.ImageAnnotatorClient(credentials=google_credentials)
     _, file_extension = os.path.splitext(file_path)
     mime_type = ""
-
     if file_extension.lower() == '.pdf':
         mime_type = 'application/pdf'
     elif file_extension.lower() in ('.jpg', '.jpeg', '.png'):
-        mime_type = 'image/jpeg' # Treat PNG as JPEG for Vision API
+        mime_type = 'image/jpeg'
     else:
         raise ValueError(f"Unsupported file type: {file_extension}.")
-
     with open(file_path, 'rb') as f:
         content = f.read()
-    
     pages = []
-    
     if mime_type == 'application/pdf':
         input_config = vision.InputConfig(mime_type=mime_type, content=content)
         features = [vision.Feature(type_=vision.Feature.Type.DOCUMENT_TEXT_DETECTION)]
         requests = [vision.AnnotateFileRequest(input_config=input_config, features=features)]
-        
         batch_response = vision_client.batch_annotate_files(requests=requests)
         for i, file_response in enumerate(batch_response.responses):
             for j, image_response in enumerate(file_response.responses):
@@ -147,12 +153,10 @@ def extract_text_from_pages(file_path, google_credentials):
         response = vision_client.document_text_detection(image=image)
         if response.error.message:
             raise Exception(f'Error from Vision API: {response.error.message}')
-        pages.append({"page_num": 1, "text": response.full_text_annotation.text})
-        
+        pages.append({"page_num": 1, "text": image_response.full_text_annotation.text})
     return pages
 
 def run_gpt_analysis(prompt, openai_api_key):
-    """Helper function to run a single GPT analysis and parse JSON."""
     try:
         client = OpenAI(api_key=openai_api_key)
         response = client.chat.completions.create(
@@ -170,40 +174,35 @@ def run_gpt_analysis(prompt, openai_api_key):
         print(f"An unexpected error occurred during OpenAI call: {e}")
         return None
 
-def process_documents_v3(filepaths, google_credentials, openai_api_key, entity_filter=None):
+# --- NEW Refactored Core Logic ---
+
+def run_stage1_for_file(filepath, google_credentials, openai_api_key):
     """
-    REVISED: The main V3 processing pipeline updated for the new prompt structure.
+    NEW: Runs Stage 1 processing for a single file.
     """
-    print("Starting V5 processing pipeline...")
+    doc_name = os.path.basename(filepath)
     all_page_outputs = []
+    pages = extract_text_from_pages(filepath, google_credentials)
+    for page in pages:
+        print(f"    - Analyzing page {page['page_num']} of {doc_name}...")
+        prompt = get_stage1_prompt(page['text'], doc_name, page['page_num'])
+        page_summary = run_gpt_analysis(prompt, openai_api_key)
+        if page_summary and page_summary.get("consumption_records"):
+            all_page_outputs.append(page_summary)
+    return all_page_outputs
 
-    # --- STAGE 1: Page-by-Page Analysis ---
-    for fp in filepaths:
-        doc_name = os.path.basename(fp)
-        print(f"  - Stage 1: Processing document '{doc_name}'")
-        try:
-            pages = extract_text_from_pages(fp, google_credentials)
-            for page in pages:
-                print(f"    - Analyzing page {page['page_num']}...")
-                prompt = get_stage1_prompt(page['text'], doc_name, page['page_num'])
-                page_summary = run_gpt_analysis(prompt, openai_api_key)
-                
-                if page_summary and page_summary.get("site_bills"):
-                    all_page_outputs.append(page_summary)
-
-        except Exception as e:
-            print(f"Error processing document {doc_name}: {e}")
-            continue
-
+def run_stage2_aggregation(all_page_outputs, openai_api_key, entity_filter=None):
+    """
+    NEW: Runs Stage 2 aggregation on a collection of Stage 1 results.
+    """
     if not all_page_outputs:
-        raise Exception("Stage 1 Analysis failed. No billing data could be extracted from any page.")
-
-    # --- STAGE 2: Final Aggregation ---
-    print(f"  - Stage 2: Aggregating data from {len(all_page_outputs)} pages...")
+        raise Exception("No data was extracted to aggregate.")
+    
+    print(f"  - Stage 2: Aggregating data from {len(all_page_outputs)} page summaries...")
     final_prompt = get_stage2_prompt(all_page_outputs, entity_filter)
     final_report = run_gpt_analysis(final_prompt, openai_api_key)
     
     if not final_report:
-        raise Exception("Stage 2 Aggregation failed. Could not synthesize the final report.")
-
+        raise Exception("Stage 2 Aggregation failed to synthesize the final report.")
+        
     return final_report
