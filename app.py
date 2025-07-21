@@ -1,10 +1,10 @@
 import os
-import json # <--- Add this import
+import uuid
 from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 from google.oauth2 import service_account
-import ocr_logic
+import ocr_logic # Your refactored V6 functions
 
 # Load environment variables
 load_dotenv(override=True)
@@ -13,58 +13,89 @@ app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# --- MODIFIED CREDENTIALS LOADING ---
-GOOGLE_CREDENTIALS_JSON = os.getenv('GOOGLE_CREDENTIALS_JSON')
+# CHANGED: Loads credentials from a file path, which is standard for AWS.
+GOOGLE_KEY_PATH = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+google_credentials = service_account.Credentials.from_service_account_file(GOOGLE_KEY_PATH)
 
-if not GOOGLE_CREDENTIALS_JSON:
-    raise ValueError("Missing GOOGLE_CREDENTIALS_JSON environment variable.")
-if not OPENAI_API_KEY:
-    raise ValueError("Missing OPENAI_API_KEY environment variable.")
-
-# Load credentials from the JSON string
-try:
-    google_credentials_info = json.loads(GOOGLE_CREDENTIALS_JSON)
-    google_credentials = service_account.Credentials.from_service_account_info(google_credentials_info)
-except json.JSONDecodeError:
-    raise ValueError("Could not decode GOOGLE_CREDENTIALS_JSON. Make sure it's a valid JSON string.")
+# NEW: In-memory session storage to hold data between requests.
+# In a production environment, use a more persistent store like Redis or a database.
+SESSIONS = {}
 
 @app.route('/')
 def index():
     """Render the main upload page."""
     return render_template('index.html')
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    """Handle file uploads and dispatch to the V3 processing logic."""
-    entity_filter = request.form.get('entity_filter', '').strip() or None
-    files = request.files.getlist('file')
+# NEW: Endpoint to start a session for a new batch of uploads.
+@app.route('/start_session', methods=['POST'])
+def start_session():
+    """Initializes a new session to store intermediate results."""
+    session_id = str(uuid.uuid4())
+    SESSIONS[session_id] = []
+    print(f"Started new session: {session_id}")
+    return jsonify({"session_id": session_id})
 
-    if not files or files[0].filename == '':
-        return jsonify({"error": "No files selected"}), 400
+# NEW: Endpoint to process one file at a time, preventing timeouts.
+@app.route('/upload_and_process_file', methods=['POST'])
+def upload_and_process_file():
+    """Processes a single file and adds its Stage 1 results to the session."""
+    session_id = request.form.get('session_id')
+    if not session_id or session_id not in SESSIONS:
+        return jsonify({"error": "Invalid or expired session ID"}), 400
 
-    filepaths = []
+    file = request.files.get('file')
+    if not file:
+        return jsonify({"error": "No file provided"}), 400
+
     try:
-        for file in files:
-            filename = secure_filename(file.filename)
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            file.save(filepath)
-            filepaths.append(filepath)
+        filename = secure_filename(file.filename)
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
 
-        # --- NEW V3 LOGIC ---
-        # All requests now go through the same advanced V3 pipeline.
-        result = ocr_logic.process_documents_v3(filepaths, google_credentials, OPENAI_API_KEY, entity_filter)
+        # Run Stage 1 processing for the single file
+        page_outputs = ocr_logic.run_stage1_for_file(filepath, google_credentials, OPENAI_API_KEY)
         
-        return jsonify(result)
+        # Add the extracted data to the session
+        SESSIONS[session_id].extend(page_outputs)
+        
+        print(f"Processed file {filename} for session {session_id}")
+        return jsonify({"success": True, "file": filename})
 
     except Exception as e:
-        # Provide a more user-friendly error
-        return jsonify({"error": f"An error occurred during processing: {e}"}), 500
+        return jsonify({"error": str(e)}), 500
     finally:
-        # Clean up all temporary files
-        for fp in filepaths:
-            if os.path.exists(fp):
-                os.remove(fp)
+        if 'filepath' in locals() and os.path.exists(filepath):
+            os.remove(filepath)
+
+# NEW: Endpoint to aggregate results after all files are processed.
+@app.route('/aggregate_results', methods=['POST'])
+def aggregate_results():
+    """Aggregates all results from a session and returns the final report."""
+    data = request.get_json()
+    session_id = data.get('session_id')
+    entity_filter = data.get('entity_filter')
+
+    if not session_id or session_id not in SESSIONS:
+        return jsonify({"error": "Invalid or expired session ID"}), 400
+
+    try:
+        all_page_outputs = SESSIONS[session_id]
+        if not all_page_outputs:
+             return jsonify({"error": "No data was extracted to aggregate."}), 400
+
+        # Run Stage 2 aggregation
+        final_report = ocr_logic.run_stage2_aggregation(all_page_outputs, OPENAI_API_KEY, entity_filter)
+        
+        return jsonify(final_report)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    finally:
+        # Clean up the session after aggregation
+        if session_id in SESSIONS:
+            del SESSIONS[session_id]
+            print(f"Session {session_id} cleaned up.")
 
 if __name__ == '__main__':
     app.run(debug=True)
