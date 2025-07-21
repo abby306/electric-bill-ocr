@@ -14,7 +14,7 @@ app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
 # CHANGED: Loads credentials from a file path, which is standard for AWS.
-GOOGLE_KEY_PATH = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+GOOGLE_KEY_PATH = os.getenv('GOOGLE_CREDENTIALS_JSON')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 google_credentials = service_account.Credentials.from_service_account_file(GOOGLE_KEY_PATH)
 
