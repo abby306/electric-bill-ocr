@@ -1,5 +1,6 @@
 import os
 import uuid
+import json # <-- ADDED: Required for parsing the JSON string
 from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
@@ -13,13 +14,24 @@ app = Flask(__name__)
 app.config['UPLOAD_FOLDER'] = 'uploads'
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# CHANGED: Loads credentials from a file path, which is standard for AWS.
-GOOGLE_KEY_PATH = os.getenv('GOOGLE_CREDENTIALS_JSON')
+# --- REVERTED TO OLD CREDENTIAL LOADING METHOD ---
+GOOGLE_CREDENTIALS_JSON = os.getenv('GOOGLE_CREDENTIALS_JSON')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-google_credentials = service_account.Credentials.from_service_account_file(GOOGLE_KEY_PATH)
 
-# NEW: In-memory session storage to hold data between requests.
-# In a production environment, use a more persistent store like Redis or a database.
+if not GOOGLE_CREDENTIALS_JSON:
+    raise ValueError("Missing GOOGLE_CREDENTIALS_JSON environment variable.")
+if not OPENAI_API_KEY:
+    raise ValueError("Missing OPENAI_API_KEY environment variable.")
+
+# Load credentials from the JSON string
+try:
+    google_credentials_info = json.loads(GOOGLE_CREDENTIALS_JSON)
+    google_credentials = service_account.Credentials.from_service_account_info(google_credentials_info)
+except json.JSONDecodeError:
+    raise ValueError("Could not decode GOOGLE_CREDENTIALS_JSON. Make sure it's a valid JSON string.")
+# --- END OF REVERTED BLOCK ---
+
+# In-memory session storage (for demonstration purposes)
 SESSIONS = {}
 
 @app.route('/')
@@ -54,6 +66,7 @@ def upload_and_process_file():
         file.save(filepath)
 
         # Run Stage 1 processing for the single file
+        # This now uses the 'google_credentials' object created with the old method
         page_outputs = ocr_logic.run_stage1_for_file(filepath, google_credentials, OPENAI_API_KEY)
         
         # Add the extracted data to the session
