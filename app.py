@@ -1,114 +1,139 @@
 import os
 import uuid
-import json # <-- ADDED: Required for parsing the JSON string
+import json
+import shutil
 from flask import Flask, request, jsonify, render_template
 from werkzeug.utils import secure_filename
 from dotenv import load_dotenv
 from google.oauth2 import service_account
-import ocr_logic # Your refactored V6 functions
+import ocr_logic  # Your OCR logic module
 
 # Load environment variables
 load_dotenv(override=True)
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = 'uploads'
-os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# --- REVERTED TO OLD CREDENTIAL LOADING METHOD ---
-GOOGLE_CREDENTIALS_JSON = os.getenv('GOOGLE_CREDENTIALS_JSON')
+# --- Configuration ---
+# Use a dedicated folder for temporary processing files
+PROCESSING_FOLDER = 'processing'
+UPLOAD_FOLDER = 'uploads'
+os.makedirs(PROCESSING_FOLDER, exist_ok=True)
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# No longer need Flask-Session, as we are managing state manually.
+# app.config['SECRET_KEY'] = os.getenv("FLASK_SECRET_KEY", os.urandom(24))
+
+# --- Credentials ---
+GOOGLE_KEY_PATH = os.getenv('GOOGLE_CREDENTIALS_JSON')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-
-if not GOOGLE_CREDENTIALS_JSON:
-    raise ValueError("Missing GOOGLE_CREDENTIALS_JSON environment variable.")
-if not OPENAI_API_KEY:
-    raise ValueError("Missing OPENAI_API_KEY environment variable.")
-
-# Load credentials from the JSON string
 try:
-    google_credentials_info = json.loads(GOOGLE_CREDENTIALS_JSON)
-    google_credentials = service_account.Credentials.from_service_account_info(google_credentials_info)
-except json.JSONDecodeError:
-    raise ValueError("Could not decode GOOGLE_CREDENTIALS_JSON. Make sure it's a valid JSON string.")
-# --- END OF REVERTED BLOCK ---
-
-# In-memory session storage (for demonstration purposes)
-SESSIONS = {}
+    google_credentials = service_account.Credentials.from_service_account_file(GOOGLE_KEY_PATH)
+except Exception as e:
+    print(f"CRITICAL: Failed to load Google credentials. The application may not function. Error: {e}")
+    google_credentials = None
 
 @app.route('/')
 def index():
-    """Render the main upload page."""
     return render_template('index.html')
 
-# NEW: Endpoint to start a session for a new batch of uploads.
 @app.route('/start_session', methods=['POST'])
 def start_session():
-    """Initializes a new session to store intermediate results."""
+    """
+    Initializes a new processing session by creating a unique directory.
+    """
     session_id = str(uuid.uuid4())
-    SESSIONS[session_id] = []
+    session_path = os.path.join(PROCESSING_FOLDER, session_id)
+    os.makedirs(session_path, exist_ok=True)
     print(f"Started new session: {session_id}")
     return jsonify({"session_id": session_id})
 
-# NEW: Endpoint to process one file at a time, preventing timeouts.
+def is_session_valid(session_id):
+    """
+    Checks if a session directory exists.
+    """
+    if not session_id or '..' in session_id or '/' in session_id: # Basic security check
+        return False
+    return os.path.isdir(os.path.join(PROCESSING_FOLDER, session_id))
+
 @app.route('/upload_and_process_file', methods=['POST'])
 def upload_and_process_file():
-    """Processes a single file and adds its Stage 1 results to the session."""
+    """
+    Processes a single file and saves its extracted data to a file in the session directory.
+    """
     session_id = request.form.get('session_id')
-    if not session_id or session_id not in SESSIONS:
+    if not is_session_valid(session_id):
         return jsonify({"error": "Invalid or expired session ID"}), 400
 
     file = request.files.get('file')
-    if not file:
+    if not file or not file.filename:
         return jsonify({"error": "No file provided"}), 400
 
-    try:
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
+    filename = secure_filename(file.filename)
+    filepath = os.path.join(UPLOAD_FOLDER, f"{session_id}_{filename}")
+    file.save(filepath)
 
-        # Run Stage 1 processing for the single file
-        # This now uses the 'google_credentials' object created with the old method
+    try:
+        if not google_credentials:
+            raise ConnectionError("Google credentials are not loaded.")
+            
+        # Stage 1: OCR and AI processing
         page_outputs = ocr_logic.run_stage1_for_file(filepath, google_credentials, OPENAI_API_KEY)
-        
-        # Add the extracted data to the session
-        SESSIONS[session_id].extend(page_outputs)
-        
+
+        # Save the result to its own JSON file within the session directory
+        if page_outputs:
+            result_filename = f"{os.path.splitext(filename)[0]}.json"
+            result_filepath = os.path.join(PROCESSING_FOLDER, session_id, result_filename)
+            with open(result_filepath, 'w') as f:
+                json.dump(page_outputs, f)
+
         print(f"Processed file {filename} for session {session_id}")
         return jsonify({"success": True, "file": filename})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        # Provide a more specific error message to the frontend
+        return jsonify({"error": f"Failed to process {filename}: {str(e)}"}), 500
     finally:
-        if 'filepath' in locals() and os.path.exists(filepath):
+        # Clean up the uploaded file immediately after processing
+        if os.path.exists(filepath):
             os.remove(filepath)
 
-# NEW: Endpoint to aggregate results after all files are processed.
 @app.route('/aggregate_results', methods=['POST'])
 def aggregate_results():
-    """Aggregates all results from a session and returns the final report."""
+    """
+    Aggregates all individual file results from a session directory.
+    """
     data = request.get_json()
     session_id = data.get('session_id')
     entity_filter = data.get('entity_filter')
 
-    if not session_id or session_id not in SESSIONS:
+    if not is_session_valid(session_id):
         return jsonify({"error": "Invalid or expired session ID"}), 400
+    
+    session_path = os.path.join(PROCESSING_FOLDER, session_id)
 
     try:
-        all_page_outputs = SESSIONS[session_id]
-        if not all_page_outputs:
-             return jsonify({"error": "No data was extracted to aggregate."}), 400
-
-        # Run Stage 2 aggregation
-        final_report = ocr_logic.run_stage2_aggregation(all_page_outputs, OPENAI_API_KEY, entity_filter)
+        all_page_outputs = []
+        # Read all the .json files from the session directory
+        for json_file in os.listdir(session_path):
+            if json_file.endswith('.json'):
+                with open(os.path.join(session_path, json_file), 'r') as f:
+                    all_page_outputs.extend(json.load(f))
         
+        if not all_page_outputs:
+            return jsonify({"error": "No data was extracted from the provided documents."}), 400
+
+        # Stage 2: Aggregation logic
+        final_report = ocr_logic.run_stage2_aggregation(all_page_outputs, OPENAI_API_KEY, entity_filter)
+
         return jsonify(final_report)
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"Failed to aggregate results: {str(e)}"}), 500
     finally:
-        # Clean up the session after aggregation
-        if session_id in SESSIONS:
-            del SESSIONS[session_id]
+        # Clean up the entire session directory after aggregation
+        if os.path.isdir(session_path):
+            shutil.rmtree(session_path)
             print(f"Session {session_id} cleaned up.")
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(host='0.0.0.0', port=5000)
