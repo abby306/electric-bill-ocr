@@ -35,7 +35,7 @@ def get_stage1_prompt(raw_text, doc_name, page_num):
     3.  **Data Extraction Logic per Block:**
         - **For a Summary Table (Type A):**
             a. For EACH row, extract the `site_id`, `site_name` or `service_address`.
-            b. Find the `consumption_value`. The column header could be "Total kWh", "Total Energy (kWh)", "Consumption", "Usage in m³", "GJ", or similar. Be flexible.
+            b. Find the `consumption_value`. The column header could be "Total kWh", "Total Energy (kWh)", "Consumption", "Usage in m³", "GJ", or similar. Be flexible. If there is such a table, give it top priority, whatever is in the table should appear in the output
             c. Extract the `consumption_unit` from the header or data.
             d. Use the global `billing_period` found in Step 1 for every record in this table.
         - **For a Detail Section (Type B):**
